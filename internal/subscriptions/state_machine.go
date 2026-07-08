@@ -20,21 +20,28 @@ var allowedTransitions = map[string][]string{
 	StatusExpired:   {},
 }
 
-// IsKnownStatus reports whether status is part of the supported subscription state graph.
-func IsKnownStatus(status string) bool {
-	_, ok := allowedTransitions[status]
-	return ok
+var knownStatuses = map[string]bool{
+	StatusPending:   true,
+	StatusActive:    true,
+	StatusPaused:    true,
+	StatusCancelled: true,
+	StatusExpired:   true,
+}
+
+// IsKnownStatus checks whether a status string is a recognised subscription status.
+func IsKnownStatus(s string) bool {
+	return knownStatuses[s]
 }
 
 // CanTransition validates state change
 func CanTransition(from, to string) error {
+	if from == to {
+		return nil // no-op allowed
+	}
+
 	allowed, ok := allowedTransitions[from]
 	if !ok {
 		return fmt.Errorf("unknown current state: %s", from)
-	}
-
-	if from == to {
-		return nil // no-op allowed
 	}
 
 	for _, a := range allowed {
