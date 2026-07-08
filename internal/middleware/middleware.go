@@ -1,146 +1,47 @@
 package middleware
 
 import (
-	"fmt"
-	"log"
+	"context"
 	"net/http"
-	"strings"
-	"sync"
-	"time"
 
-	"github.com/gin-gonic/gin"
-	"stellarbill-backend/internal/security"
+	"go.opentelemetry.io/otel/baggage"
 )
+
+// ContextKey ensures type safety for context extraction.
+type ContextKey string
 
 const (
-	AuthSubjectKey = "auth_subject"
+	TenantIDKey   ContextKey = "tenant_id"
+	CustomerIDKey ContextKey = "customer_id"
 )
 
-type RateLimiter struct {
-	mu      sync.Mutex
-	limit   int
-	window  time.Duration
-	now     func() time.Time
-	clients map[string]rateLimitEntry
-}
+// BaggageMiddleware extracts tenant and customer IDs and populates the OpenTelemetry Baggage context.
+func BaggageMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx := r.Context()
 
-type rateLimitEntry struct {
-	count   int
-	expires time.Time
-}
+		tenantID, _ := ctx.Value(TenantIDKey).(string)
+		customerID, _ := ctx.Value(CustomerIDKey).(string)
 
-func NewRateLimiter(limit int, window time.Duration) *RateLimiter {
-	return &RateLimiter{
-		limit:   limit,
-		window:  window,
-		now:     time.Now,
-		clients: make(map[string]rateLimitEntry),
-	}
-}
+		var members []baggage.Member
 
-func Logging(logger *log.Logger) gin.HandlerFunc {
-	return func(c *gin.Context) {
-		start := time.Now()
-		c.Next()
-
-		requestID, _ := c.Get(RequestIDKey)
-		path := c.FullPath()
-		if path == "" {
-			path = c.Request.URL.Path
+		if tenantID != "" {
+			if m, err := baggage.NewMember("tenant_id", tenantID); err == nil {
+				members = append(members, m)
+			}
 		}
-		msg := fmt.Sprintf(
-			"method=%s path=%s status=%d request_id=%v duration=%s",
-			c.Request.Method,
-			security.MaskPII(path),
-			c.Writer.Status(),
-			requestID,
-			time.Since(start).Round(time.Millisecond),
-		)
-		logger.Printf("%s", msg)
-	}
-}
-
-func RateLimit(limiter *RateLimiter) gin.HandlerFunc {
-	return func(c *gin.Context) {
-		if limiter == nil || limiter.Allow(c.ClientIP()) {
-			c.Next()
-			return
+		if customerID != "" {
+			if m, err := baggage.NewMember("customer_id", customerID); err == nil {
+				members = append(members, m)
+			}
 		}
 
-		requestID, _ := c.Get(RequestIDKey)
-		c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{
-			"error":      "rate limit exceeded",
-			"request_id": requestID,
-		})
-	}
-}
-
-func Auth(jwtSecret string) gin.HandlerFunc {
-	return func(c *gin.Context) {
-		if c.Request.Method == http.MethodOptions {
-			c.Next()
-			return
+		if len(members) > 0 {
+			if bag, err := baggage.New(members...); err == nil {
+				ctx = baggage.ContextWithBaggage(ctx, bag)
+			}
 		}
 
-		token := strings.TrimSpace(strings.TrimPrefix(c.GetHeader("Authorization"), "Bearer"))
-		if token == "" || token != jwtSecret {
-			requestID, _ := c.Get(RequestIDKey)
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
-				"error":      "unauthorized",
-				"request_id": requestID,
-			})
-			return
-		}
-
-		c.Set(AuthSubjectKey, "api-client")
-		c.Next()
-	}
-}
-
-func (r *RateLimiter) Allow(key string) bool {
-	if r == nil {
-		return true
-	}
-
-	now := r.now()
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	entry := r.clients[key]
-	if entry.expires.Before(now) {
-		entry = rateLimitEntry{
-			count:   0,
-			expires: now.Add(r.window),
-		}
-	}
-
-	if entry.count >= r.limit {
-		r.clients[key] = entry
-		return false
-	}
-
-	entry.count++
-	r.clients[key] = entry
-	return true
-}
-
-// DeprecationHeaders marks legacy /api/* aliases as deprecated and points
-// clients at the canonical /api/v1/* successor. Do not attach it to /api/v1/*
-// routes.
-func DeprecationHeaders() gin.HandlerFunc {
-	return func(c *gin.Context) {
-		path := c.Request.URL.Path
-		const legacyPrefix = "/api/"
-		const canonicalPrefix = "/api/v1/"
-		if !strings.HasPrefix(path, legacyPrefix) || strings.HasPrefix(path, canonicalPrefix) {
-			c.Next()
-			return
-		}
-
-		c.Header("Deprecation", "true")
-		c.Header("Sunset", time.Now().Add(180*24*time.Hour).Format(time.RFC1123))
-		c.Header("Link", `</api/v1`+path[len("/api"):]+`>; rel="successor-version"`)
-
-		c.Next()
-	}
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
 }

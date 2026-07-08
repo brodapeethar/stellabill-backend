@@ -39,7 +39,6 @@ func NewSubscriptionService(subRepo repository.SubscriptionRepository, planRepo 
 
 // GetDetail retrieves a full SubscriptionDetail for the given subscriptionID.
 // It enforces ownership (callerID must match the subscription's CustomerID),
-//
 // handles soft-deletes, joins plan metadata, and normalizes billing fields.
 func (s *subscriptionService) GetDetail(ctx context.Context, tenantID string, callerID string, subscriptionID string) (*SubscriptionDetail, []string, error) {
 	ctx, span := tracer.Start(ctx, "SubscriptionService.GetDetail",
@@ -132,18 +131,20 @@ func (s *subscriptionService) GetDetail(ctx context.Context, tenantID string, ca
 	return detail, warnings, nil
 }
 
-// ChangeStatus validates and persists a tenant-scoped subscription status change.
+// ChangeStatus transitions a subscription to a new status after validating tenant scoping
+// and checking that the transition is allowed per the state machine.
 func (s *subscriptionService) ChangeStatus(ctx context.Context, tenantID string, actorID string, subscriptionID string, targetStatus string) (*SubscriptionStatusChange, error) {
 	ctx, span := tracer.Start(ctx, "SubscriptionService.ChangeStatus",
 		trace.WithAttributes(
 			attribute.String("subscription.id", subscriptionID),
 			attribute.String("tenant.id", tenantID),
-			attribute.String("actor.id", actorID),
-			attribute.String("subscription.target_status", targetStatus),
+			attribute.String("target.status", targetStatus),
 		))
 	defer span.End()
 
-	targetStatus = strings.TrimSpace(targetStatus)
+	if !subscriptions.IsKnownStatus(targetStatus) {
+		return nil, fmt.Errorf("%w: %s", ErrInvalidStatus, targetStatus)
+	}
 
 	row, err := s.subRepo.FindByIDAndTenant(ctx, subscriptionID, tenantID)
 	if err != nil {
@@ -157,32 +158,33 @@ func (s *subscriptionService) ChangeStatus(ctx context.Context, tenantID string,
 		return nil, ErrDeleted
 	}
 
-	if !subscriptions.IsKnownStatus(targetStatus) {
-		return nil, fmt.Errorf("%w: %s", ErrInvalidStatus, targetStatus)
+	if !subscriptions.IsKnownStatus(row.Status) {
+		return nil, fmt.Errorf("%w: %s", ErrUnknownCurrentState, row.Status)
+	}
+
+	if row.Status == targetStatus {
+		return &SubscriptionStatusChange{
+			ID:             row.ID,
+			Status:         row.Status,
+			PreviousStatus: row.Status,
+			Changed:        false,
+		}, nil
+	}
+
+	if err := subscriptions.CanTransition(row.Status, targetStatus); err != nil {
+		return nil, fmt.Errorf("%w: %s", ErrInvalidTransition, err)
 	}
 
 	previousStatus := row.Status
-	if err := subscriptions.CanTransition(previousStatus, targetStatus); err != nil {
-		if !subscriptions.IsKnownStatus(previousStatus) {
-			return nil, fmt.Errorf("%w: %s", ErrUnknownCurrentState, previousStatus)
-		}
-		return nil, fmt.Errorf("%w: %s", ErrInvalidTransition, err.Error())
-	}
 
-	changed := previousStatus != targetStatus
-	if changed {
-		if err := s.subRepo.UpdateStatus(ctx, subscriptionID, tenantID, targetStatus); err != nil {
-			if errors.Is(err, repository.ErrNotFound) {
-				return nil, ErrNotFound
-			}
-			return nil, err
-		}
+	if err := s.subRepo.UpdateStatus(ctx, subscriptionID, tenantID, targetStatus); err != nil {
+		return nil, err
 	}
 
 	return &SubscriptionStatusChange{
-		ID:             subscriptionID,
-		PreviousStatus: previousStatus,
+		ID:             row.ID,
 		Status:         targetStatus,
-		Changed:        changed,
+		PreviousStatus: previousStatus,
+		Changed:        true,
 	}, nil
 }

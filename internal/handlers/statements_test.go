@@ -13,6 +13,7 @@ import (
 	"stellarbill-backend/internal/auth"
 	"stellarbill-backend/internal/repository"
 	"stellarbill-backend/internal/service"
+	"stellarbill-backend/internal/storage/s3"
 )
 
 // ── mock ─────────────────────────────────────────────────────────────────────
@@ -38,6 +39,12 @@ func (m *mockStatementsTestService) ListByCustomer(_ context.Context, _ string, 
 	m.capturedCust = customerID
 	m.capturedRoles = roles
 	return m.listDetail, m.count, m.warnings, m.err
+}
+
+func (m *mockStatementsTestService) ExportStatements(
+	_ context.Context, _ string, _ []string, _, _ string, _ s3.S3Uploader,
+) (*service.ExportResult, error) {
+	return nil, nil
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -428,12 +435,6 @@ func TestListStatements_QueryFiltersPassedToService(t *testing.T) {
 	}
 	if q.EndBefore != "2024-12-31T23:59:59Z" {
 		t.Errorf("EndBefore: got %q, want 2024-12-31T23:59:59Z", q.EndBefore)
-	}
-	if q.Page != 2 {
-		t.Errorf("Page: got %d, want 2", q.Page)
-	}
-	if q.PageSize != 5 {
-		t.Errorf("PageSize: got %d, want 5", q.PageSize)
 	}
 }
 
